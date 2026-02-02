@@ -17,7 +17,7 @@ from PySide6.QtGui import QColor, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit,
     QHBoxLayout, QVBoxLayout, QTextEdit, QMessageBox, QGroupBox, QFormLayout,
-    QSpinBox, QCheckBox, QScrollArea
+    QSpinBox, QCheckBox, QScrollArea, QListWidget, QListWidgetItem
 )
 
 
@@ -33,6 +33,9 @@ class AppConfig:
     telegram_enabled: bool = False
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    virustotal_enabled: bool = False
+    virustotal_api_key: str = ""
+    block_suspicious_urls: bool = True
 
 
 @dataclass
@@ -47,6 +50,16 @@ class ChangeResult:
     new_city: str
     changed: bool
     note: str = ""
+
+
+@dataclass
+class URLReputationResult:
+    url: str
+    is_safe: bool
+    threat_level: str  # clean, suspicious, malicious
+    threat_count: int
+    analysis_date: str
+    details: str = ""
 
 
 # -----------------------------
@@ -166,6 +179,97 @@ def send_telegram_notification(config: AppConfig, message: str) -> None:
         pass
 
 
+def check_url_reputation(url: str, api_key: str) -> URLReputationResult:
+    """
+    Check URL reputation using VirusTotal API.
+    Returns URLReputationResult with safety information.
+    """
+    if not api_key or not url:
+        return URLReputationResult(
+            url=url,
+            is_safe=False,
+            threat_level="unknown",
+            threat_count=0,
+            analysis_date="",
+            details="API key is missing"
+        )
+    
+    try:
+        # Scan the URL
+        scan_url = "https://www.virustotal.com/api/v3/urls"
+        headers = {"x-apikey": api_key}
+        files = {"url": (None, url)}
+        
+        response = requests.post(scan_url, headers=headers, files=files, timeout=10)
+        
+        if response.status_code != 200:
+            return URLReputationResult(
+                url=url,
+                is_safe=False,
+                threat_level="error",
+                threat_count=0,
+                analysis_date="",
+                details=f"VirusTotal API error: {response.status_code}"
+            )
+        
+        scan_data = response.json()
+        analysis_id = scan_data["data"]["id"]
+        
+        # Get analysis results
+        analysis_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
+        time.sleep(2)  # Wait before checking results
+        
+        analysis_response = requests.get(analysis_url, headers=headers, timeout=10)
+        
+        if analysis_response.status_code == 200:
+            analysis_data = analysis_response.json()
+            stats = analysis_data["data"]["attributes"]["stats"]
+            
+            threat_count = stats.get("malicious", 0) + stats.get("suspicious", 0)
+            
+            if stats.get("malicious", 0) > 0:
+                threat_level = "malicious"
+            elif stats.get("suspicious", 0) > 0:
+                threat_level = "suspicious"
+            else:
+                threat_level = "clean"
+            
+            is_safe = threat_level == "clean"
+            
+            details = (
+                f"Malicious: {stats.get('malicious', 0)} | "
+                f"Suspicious: {stats.get('suspicious', 0)} | "
+                f"Clean: {stats.get('undetected', 0)}"
+            )
+            
+            return URLReputationResult(
+                url=url,
+                is_safe=is_safe,
+                threat_level=threat_level,
+                threat_count=threat_count,
+                analysis_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                details=details
+            )
+    except requests.exceptions.Timeout:
+        return URLReputationResult(
+            url=url,
+            is_safe=False,
+            threat_level="error",
+            threat_count=0,
+            analysis_date="",
+            details="VirusTotal API timeout"
+        )
+    except Exception as e:
+        return URLReputationResult(
+            url=url,
+            is_safe=False,
+            threat_level="error",
+            threat_count=0,
+            analysis_date="",
+            details=f"Error checking reputation: {str(e)}"
+        )
+
+
 # -----------------------------
 # Worker thread for "Change Identity"
 # -----------------------------
@@ -231,6 +335,214 @@ class ChangeWorker(QThread):
             self.done.emit(res)
         except Exception as e:
             self.failed.emit(str(e))
+
+
+# -----------------------------
+# UI - URL Check Dialog
+# -----------------------------
+class URLCheckDialog(QWidget):
+    def __init__(self, config: AppConfig):
+        super().__init__()
+        self.config = config
+        self.url_results = []
+        
+        self.setWindowTitle("🛡️ Website Reputation Check")
+        self.setGeometry(100, 100, 700, 500)
+        
+        # Apply stylesheet
+        self.setStyleSheet("""
+            QWidget {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, 
+                            stop:0 #1a1a2e, stop:0.5 #16213e, stop:1 #0f3460);
+            }
+            QGroupBox {
+                border: 3px solid;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 10px;
+                font-weight: bold;
+                color: #ffffff;
+                padding-left: 10px;
+                padding-right: 10px;
+                padding-bottom: 10px;
+            }
+            QGroupBox#configGroup {
+                border-color: #ff6b9d;
+                background-color: rgba(255, 107, 157, 0.05);
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+                font-size: 12pt;
+            }
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                            stop:0 #00d4ff, stop:1 #0099cc);
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 10px 15px;
+                font-weight: bold;
+                font-size: 11pt;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                            stop:0 #00e8ff, stop:1 #00b3e6);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                            stop:0 #0099cc, stop:1 #006699);
+            }
+            QLabel {
+                color: #ffffff;
+                font-size: 10pt;
+            }
+            QLineEdit {
+                border: 2px solid #00d4ff;
+                border-radius: 4px;
+                padding: 6px;
+                background-color: #0f3460;
+                color: #00ff88;
+                selection-background-color: #00d4ff;
+                selection-color: #000000;
+            }
+            QLineEdit:focus {
+                border: 2px solid #ff6b9d;
+            }
+            QListWidget {
+                border: 2px solid #00d4ff;
+                border-radius: 4px;
+                background-color: #0a1929;
+                color: #00ff88;
+            }
+            QListWidget::item {
+                padding: 8px;
+                margin: 2px 0;
+            }
+            QListWidget::item:selected {
+                background-color: #00d4ff;
+                color: #000000;
+            }
+        """)
+        
+        # Main layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(10)
+        
+        # URL Check Box
+        url_check_box = QGroupBox("🔍 Check Website Reputation")
+        url_check_box.setObjectName("configGroup")
+        url_check_layout = QFormLayout(url_check_box)
+        
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("Enter URL to check (e.g., https://example.com)")
+        self.url_input.setMaximumWidth(400)
+        self.check_url_btn = QPushButton("🔍 Check URL Safety")
+        self.check_url_btn.clicked.connect(self.check_url_safety)
+        
+        url_check_layout.addRow("🌐 URL to check:", self.url_input)
+        url_check_layout.addWidget(self.check_url_btn)
+        
+        # List view for checked URLs
+        self.url_list = QListWidget()
+        self.url_list.setMaximumHeight(300)
+        
+        # Results
+        results_box = QGroupBox("📋 Check Results")
+        results_box.setObjectName("configGroup")
+        results_layout = QVBoxLayout(results_box)
+        results_layout.addWidget(self.url_list)
+        
+        # Add to main layout
+        layout.addWidget(url_check_box)
+        layout.addWidget(results_box, 1)
+        
+    def check_url_safety(self):
+        """Check URL reputation and block if suspicious"""
+        url = self.url_input.text().strip()
+        if not url:
+            QMessageBox.warning(self, "⚠️ Missing URL", "Please enter a URL to check.")
+            return
+        
+        if not self.config.virustotal_enabled:
+            QMessageBox.warning(self, "⚠️ Feature Disabled", "Please enable VirusTotal URL reputation check in main configuration.")
+            return
+        
+        if not self.config.virustotal_api_key:
+            QMessageBox.warning(self, "⚠️ Missing API Key", "Please enter your VirusTotal API key in main configuration.")
+            return
+        
+        # Check reputation
+        result = check_url_reputation(url, self.config.virustotal_api_key)
+        
+        # Add result to list view
+        self._add_url_to_list(result)
+        
+        # Block or allow connection
+        if not result.is_safe and self.config.block_suspicious_urls:
+            self.url_input.clear()
+            
+            # Send alert notification
+            alert_msg = (
+                f"🚨 <b>SUSPICIOUS URL BLOCKED</b>\n\n"
+                f"<b>URL:</b> {result.url}\n"
+                f"<b>Threat Level:</b> {result.threat_level.upper()}\n"
+                f"<b>Threats:</b> {result.threat_count}\n"
+                f"<b>Details:</b> {result.details}"
+            )
+            send_telegram_notification(self.config, alert_msg)
+            
+            QMessageBox.critical(
+                self, 
+                "🚫 Connection Blocked",
+                f"This URL appears to be dangerous!\n\n"
+                f"Threat Level: {result.threat_level.upper()}\n"
+                f"Threats Detected: {result.threat_count}\n\n"
+                f"Details:\n{result.details}\n\n"
+                f"Connection has been blocked for your safety."
+            )
+        elif result.is_safe:
+            self.url_input.clear()
+            QMessageBox.information(self, "✅ URL is Safe", f"This URL appears to be safe.\n\n{result.details}")
+    
+    def _add_url_to_list(self, result: URLReputationResult):
+        """Add checked URL to the list view with color coding"""
+        # Create list item with appropriate emoji and formatting
+        if result.is_safe:
+            status_text = "✅ SAFE"
+            color = "#00ff88"  # Green
+        elif result.threat_level == "suspicious":
+            status_text = "⚠️ SUSPICIOUS"
+            color = "#ffd700"  # Gold
+        elif result.threat_level == "malicious":
+            status_text = "❌ MALICIOUS"
+            color = "#ff6b9d"  # Red
+        else:
+            status_text = "❓ UNKNOWN"
+            color = "#ffffff"  # White
+        
+        # Format the URL for display (truncate if too long)
+        display_url = result.url
+        if len(display_url) > 60:
+            display_url = display_url[:57] + "..."
+        
+        # Create item text
+        item_text = f"{status_text} | {display_url} | Threats: {result.threat_count}"
+        
+        # Create and add list item
+        item = QListWidgetItem(item_text)
+        item.setForeground(QColor(color))
+        item.setFont(QFont("Courier New", 9))
+        
+        # Store the full result in item data
+        item.setData(Qt.UserRole, result)
+        
+        # Add to list
+        self.url_list.insertItem(0, item)
+        self.url_results.append(result)
 
 
 # -----------------------------
@@ -352,6 +664,7 @@ class MainWindow(QMainWindow):
 
         self.config = AppConfig()
         self.worker = None
+        self.url_results = []  # Store URL check results
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -387,27 +700,43 @@ class MainWindow(QMainWindow):
         cfg_layout = QFormLayout(cfg_box)
 
         self.socks_input = QLineEdit(self.config.tor_socks_proxy)
+        self.socks_input.setMaximumWidth(400)
         self.control_port_input = QSpinBox()
         self.control_port_input.setRange(1, 65535)
         self.control_port_input.setValue(self.config.tor_control_port)
+        self.control_port_input.setMaximumWidth(150)
 
         self.wait_input = QSpinBox()
         self.wait_input.setRange(1, 60)
         self.wait_input.setValue(8)
+        self.wait_input.setMaximumWidth(150)
 
         self.retry_input = QSpinBox()
         self.retry_input.setRange(0, 5)
         self.retry_input.setValue(2)
+        self.retry_input.setMaximumWidth(150)
 
         self.log_enabled_cb = QCheckBox("Enable logging")
         self.log_enabled_cb.setChecked(self.config.log_enabled)
         self.log_file_input = QLineEdit(self.config.log_file)
+        self.log_file_input.setMaximumWidth(400)
 
         self.telegram_enabled_cb = QCheckBox("Enable Telegram notifications")
         self.telegram_enabled_cb.setChecked(self.config.telegram_enabled)
         self.telegram_token_input = QLineEdit(self.config.telegram_bot_token)
         self.telegram_chat_input = QLineEdit(self.config.telegram_chat_id)
         self.telegram_token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.telegram_token_input.setMaximumWidth(400)
+        self.telegram_chat_input.setMaximumWidth(400)
+
+        self.virustotal_enabled_cb = QCheckBox("Enable URL Reputation Check (VirusTotal)")
+        self.virustotal_enabled_cb.setChecked(self.config.virustotal_enabled)
+        self.virustotal_api_input = QLineEdit(self.config.virustotal_api_key)
+        self.virustotal_api_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.virustotal_api_input.setPlaceholderText("Enter your VirusTotal API key")
+        self.virustotal_api_input.setMaximumWidth(400)
+        self.block_suspicious_cb = QCheckBox("Block suspicious URLs")
+        self.block_suspicious_cb.setChecked(self.config.block_suspicious_urls)
 
         cfg_layout.addRow("🔌 Tor SOCKS proxy:", self.socks_input)
         cfg_layout.addRow("🎛️ Tor Control port:", self.control_port_input)
@@ -418,16 +747,21 @@ class MainWindow(QMainWindow):
         cfg_layout.addRow(self.telegram_enabled_cb)
         cfg_layout.addRow("🤖 Telegram bot token:", self.telegram_token_input)
         cfg_layout.addRow("💬 Telegram chat id:", self.telegram_chat_input)
+        cfg_layout.addRow(self.virustotal_enabled_cb)
+        cfg_layout.addRow("🔐 VirusTotal API key:", self.virustotal_api_input)
+        cfg_layout.addRow(self.block_suspicious_cb)
 
         # Buttons
         btn_row = QHBoxLayout()
         self.refresh_btn = QPushButton("🔄 Refresh Status")
         self.change_btn = QPushButton("🔑 Change Identity (Tor)")
         self.load_hist_btn = QPushButton("📋 Load History")
+        self.url_check_open_btn = QPushButton("🛡️ URL Reputation Check")
 
         btn_row.addWidget(self.refresh_btn)
         btn_row.addWidget(self.change_btn)
         btn_row.addWidget(self.load_hist_btn)
+        btn_row.addWidget(self.url_check_open_btn)
 
         # Output
         self.output = QTextEdit()
@@ -447,6 +781,7 @@ class MainWindow(QMainWindow):
         self.refresh_btn.clicked.connect(self.refresh_status)
         self.change_btn.clicked.connect(self.change_identity)
         self.load_hist_btn.clicked.connect(self.load_history)
+        self.url_check_open_btn.clicked.connect(self.open_url_check_dialog)
 
         # Initial
         self.refresh_status()
@@ -460,6 +795,9 @@ class MainWindow(QMainWindow):
         self.config.telegram_enabled = self.telegram_enabled_cb.isChecked()
         self.config.telegram_bot_token = self.telegram_token_input.text().strip()
         self.config.telegram_chat_id = self.telegram_chat_input.text().strip()
+        self.config.virustotal_enabled = self.virustotal_enabled_cb.isChecked()
+        self.config.virustotal_api_key = self.virustotal_api_input.text().strip()
+        self.config.block_suspicious_urls = self.block_suspicious_cb.isChecked()
 
     def refresh_status(self):
         self._sync_config_from_ui()
@@ -555,6 +893,12 @@ class MainWindow(QMainWindow):
         
         QMessageBox.critical(self, "❌ Change Failed", display_msg)
         self.output.append(f"\n❌ ERROR: {error_msg}\n")
+
+    def open_url_check_dialog(self):
+        """Open the URL reputation check dialog window"""
+        self._sync_config_from_ui()
+        self.url_dialog = URLCheckDialog(self.config)
+        self.url_dialog.show()
 
     def load_history(self):
         self._sync_config_from_ui()
